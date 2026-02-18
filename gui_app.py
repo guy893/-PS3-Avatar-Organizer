@@ -483,9 +483,24 @@ class App(tk.Tk):
             child.bind('<Button-1>', lambda e: self._toggle_vault())
 
         self._vault_body = tk.Frame(self._vault_card, bg=BG_CARD)
+
+        # Description
+        desc_text = (
+            'Link your collection to vault.psna.store \u2014 the online PSN avatar '
+            'archive. Your Vault Token authenticates exports so the site can '
+            'verify which avatars you own. Generate a token at vault.psna.store/account, '
+            'paste it below, then click Export after decrypting your EDATs. '
+            'The manifest (JSON file with filenames, Content IDs, and SHA-256 '
+            'hashes) is HMAC-signed with your token and saved locally \u2014 '
+            'upload it to the site to register your collection.'
+        )
+        tk.Label(self._vault_body, text=desc_text, bg=BG_CARD, fg=FG_DIM,
+                 font=('Segoe UI', 9), wraplength=520, justify='left',
+                 anchor='w').pack(fill='x', padx=14, pady=(8, 4))
+
         # Token row
         token_row = tk.Frame(self._vault_body, bg=BG_CARD)
-        token_row.pack(fill='x', padx=14, pady=(8, 4))
+        token_row.pack(fill='x', padx=14, pady=(4, 4))
         tk.Label(token_row, text='Vault Token', bg=BG_CARD, fg=FG_DIM,
                  font=('Segoe UI', 9)).pack(side='left', padx=(0, 8))
         self._vault_token_var = tk.StringVar(
