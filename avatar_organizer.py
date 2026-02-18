@@ -17,6 +17,7 @@ import struct
 import time
 import shutil
 import json
+import hashlib
 from enum import IntEnum
 from pathlib import Path
 
@@ -437,11 +438,13 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
         show_count (bool): append (count) to folder name
         separate_folders (bool): PNGs in previews/, EDATs in psn_avatar/
                                  (when off, PNGs + EDATs together)
+        output_mode (str): 'organized' | 'flat_custom' | 'flat_separated'
+        flat_custom_folder (str): absolute path for flat_custom mode
 
     When ``options`` is None, falls back to legacy OrgMode enum behaviour.
 
     Returns:
-        dict with keys: ok, skip, fail, total, failures, output_pngs
+        dict with keys: ok, skip, fail, total, failures, output_pngs, avatars
     """
     input_path = Path(input_folder)
     output_path = Path(output_folder)
@@ -450,14 +453,28 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
         title_lookup = {}
 
     # Resolve options
+    output_mode = None
     if options is not None:
+        output_mode = options.get('output_mode', 'organized')
         use_content_id = options.get('content_id_in_filename', True)
         show_game = options.get('show_game_name', True)
         show_tid = options.get('show_title_id', True)
         show_count = options.get('show_count', True)
         separate = options.get('separate_folders', False)
-        # With toggles, we always sort into Region/Game folders
-        use_folders = True
+
+        if output_mode == 'flat_custom':
+            custom_folder = options.get('flat_custom_folder', '')
+            if custom_folder:
+                output_path = Path(custom_folder)
+                output_path.mkdir(parents=True, exist_ok=True)
+            use_folders = False
+            separate = False
+        elif output_mode == 'flat_separated':
+            use_folders = False
+            separate = True  # reuse separate logic at flat level
+        else:
+            # organized (default)
+            use_folders = True
     elif mode is not None:
         # Legacy OrgMode support
         use_content_id = True
@@ -500,7 +517,7 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
 
     total = len(unique_files)
     stats = {'ok': 0, 'skip': 0, 'fail': 0, 'total': total, 'failures': [],
-             'output_pngs': []}
+             'output_pngs': [], 'avatars': []}
 
     if total == 0:
         return stats
@@ -521,7 +538,14 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
 
             if not use_folders:
                 # Flat mode
-                out_file = output_path / output_name
+                if output_mode == 'flat_separated':
+                    png_dir = output_path / 'previews'
+                    edat_dir = output_path / 'psn_avatar'
+                    png_dir.mkdir(parents=True, exist_ok=True)
+                    edat_dir.mkdir(parents=True, exist_ok=True)
+                    out_file = png_dir / output_name
+                else:
+                    out_file = output_path / output_name
 
                 if out_file.exists():
                     stats['skip'] += 1
@@ -533,6 +557,25 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
                 if success:
                     stats['ok'] += 1
                     stats['output_pngs'].append(str(out_file))
+
+                    # Hash EDAT and record avatar info for vault
+                    file_hash = hashlib.sha256(edat_file.read_bytes()).hexdigest()
+                    stats['avatars'].append({
+                        'psna_filename': edat_file.name,
+                        'content_id': content_id,
+                        'file_hash': file_hash,
+                    })
+
+                    # Copy EDAT alongside in flat_separated / flat_custom modes
+                    if output_mode == 'flat_separated':
+                        edat_dest = edat_dir / edat_file.name
+                        if not edat_dest.exists():
+                            shutil.copy2(edat_file, edat_dest)
+                    elif output_mode == 'flat_custom':
+                        edat_dest = output_path / edat_file.name
+                        if not edat_dest.exists():
+                            shutil.copy2(edat_file, edat_dest)
+
                     if progress_cb:
                         progress_cb(idx + 1, total, 'ok', psna_name)
                 else:
@@ -580,6 +623,14 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
                     stats['ok'] += 1
                     stats['output_pngs'].append(str(out_file))
                     game_folder_counts[folder_key]['count'] += 1
+
+                    # Hash EDAT and record avatar info for vault
+                    file_hash = hashlib.sha256(edat_file.read_bytes()).hexdigest()
+                    stats['avatars'].append({
+                        'psna_filename': edat_file.name,
+                        'content_id': content_id,
+                        'file_hash': file_hash,
+                    })
 
                     # Copy EDAT alongside
                     if separate:

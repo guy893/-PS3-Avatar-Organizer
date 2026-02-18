@@ -5,12 +5,15 @@ Decrypts PS3/PSN avatar EDAT files and organizes them with a modern tkinter inte
 """
 
 import csv
+import hashlib
+import hmac
 import json
 import os
 import subprocess
 import sys
 import threading
 import tkinter as tk
+from datetime import datetime, timezone
 from tkinter import filedialog, ttk, messagebox
 from pathlib import Path
 from queue import Queue, Empty
@@ -231,6 +234,7 @@ class App(tk.Tk):
         self._running = False
         self._start_time = 0.0
         self._taskbar = None
+        self._last_stats = None  # most recent run stats (for vault export)
 
         self._setup_styles()
         self._build_ui()
@@ -286,6 +290,11 @@ class App(tk.Tk):
         s.map('TCheckbutton',
               background=[('active', BG_CARD)])
 
+        s.configure('TRadiobutton', background=BG_CARD, foreground=FG,
+                     font=('Segoe UI', 10))
+        s.map('TRadiobutton',
+              background=[('active', BG_CARD)])
+
         s.configure('Horizontal.TProgressbar',
                      troughcolor=PROGRESS_BG, background=PROGRESS_FG,
                      borderwidth=0, thickness=10)
@@ -317,7 +326,7 @@ class App(tk.Tk):
                              font=('Segoe UI', 18, 'bold'))
         title_lbl.pack(side='left')
 
-        version_lbl = tk.Label(header, text='v1.0', bg=BG, fg=FG_DIM,
+        version_lbl = tk.Label(header, text='v1.1', bg=BG, fg=FG_DIM,
                                font=('Segoe UI', 10))
         version_lbl.pack(side='left', padx=(8, 0), pady=(8, 0))
 
@@ -350,10 +359,54 @@ class App(tk.Tk):
                                                       pady=(6, 0))
         folder_inner.columnconfigure(1, weight=1)
 
-        # -- Organization options card --
-        opts_card = make_card(main)
-        opts_card.pack(fill='x', pady=(0, 8))
-        opts_inner = tk.Frame(opts_card, bg=BG_CARD)
+        # -- Output Mode card --
+        mode_card = make_card(main)
+        mode_card.pack(fill='x', pady=(0, 8))
+        mode_inner = tk.Frame(mode_card, bg=BG_CARD)
+        mode_inner.pack(fill='x', padx=14, pady=10)
+
+        tk.Label(mode_inner, text='Output Mode', bg=BG_CARD, fg=FG_HEADING,
+                 font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(0, 6))
+
+        self._output_mode_var = tk.IntVar(
+            value=self._cfg.get('output_mode', 0))
+
+        ttk.Radiobutton(
+            mode_inner, text='Organized (Region > Game > files)',
+            variable=self._output_mode_var, value=0,
+            command=self._on_output_mode_change,
+        ).pack(anchor='w', pady=1)
+
+        ttk.Radiobutton(
+            mode_inner, text='Flat \u2014 Custom Folder',
+            variable=self._output_mode_var, value=1,
+            command=self._on_output_mode_change,
+        ).pack(anchor='w', pady=1)
+
+        # Custom folder entry (shown only for mode 1)
+        self._custom_folder_frame = tk.Frame(mode_inner, bg=BG_CARD)
+        tk.Label(self._custom_folder_frame, text='Folder path:',
+                 bg=BG_CARD, fg=FG_DIM,
+                 font=('Segoe UI', 9)).pack(side='left', padx=(20, 6))
+        self._custom_folder_var = tk.StringVar(
+            value=self._cfg.get('flat_custom_folder', ''))
+        custom_entry = ttk.Entry(self._custom_folder_frame,
+                                 textvariable=self._custom_folder_var,
+                                 width=46)
+        custom_entry.pack(side='left', fill='x', expand=True, padx=(0, 6))
+        ttk.Button(self._custom_folder_frame, text='Browse',
+                   style='Browse.TButton',
+                   command=self._browse_custom_folder).pack(side='left')
+
+        ttk.Radiobutton(
+            mode_inner, text='Flat \u2014 Separated (previews/ + psn_avatar/)',
+            variable=self._output_mode_var, value=2,
+            command=self._on_output_mode_change,
+        ).pack(anchor='w', pady=1)
+
+        # -- Organization options card (visible only in Organized mode) --
+        self._opts_card = make_card(main)
+        opts_inner = tk.Frame(self._opts_card, bg=BG_CARD)
         opts_inner.pack(fill='x', padx=14, pady=10)
 
         tk.Label(opts_inner, text='Organization Options', bg=BG_CARD,
@@ -409,23 +462,71 @@ class App(tk.Tk):
                  justify='left').grid(
                      row=4, column=0, columnspan=2, sticky='w',
                      pady=(6, 2))
-        self._update_preview()
+
+        # -- Vault Export card (collapsible) --
+        self._vault_card = make_card(main)
+        vault_header = tk.Frame(self._vault_card, bg=BG_CARD, cursor='hand2')
+        vault_header.pack(fill='x', padx=14, pady=(10, 0))
+
+        self._vault_expanded = False
+        self._vault_arrow_var = tk.StringVar(value='\u25B6')
+        tk.Label(vault_header, textvariable=self._vault_arrow_var,
+                 bg=BG_CARD, fg=FG_HEADING,
+                 font=('Segoe UI', 10)).pack(side='left')
+        tk.Label(vault_header, text=' Vault Export', bg=BG_CARD,
+                 fg=FG_HEADING,
+                 font=('Segoe UI', 10, 'bold')).pack(side='left')
+        tk.Label(vault_header, text='  (vault.psna.store)', bg=BG_CARD,
+                 fg=FG_DIM, font=('Segoe UI', 9)).pack(side='left')
+        vault_header.bind('<Button-1>', lambda e: self._toggle_vault())
+        for child in vault_header.winfo_children():
+            child.bind('<Button-1>', lambda e: self._toggle_vault())
+
+        self._vault_body = tk.Frame(self._vault_card, bg=BG_CARD)
+        # Token row
+        token_row = tk.Frame(self._vault_body, bg=BG_CARD)
+        token_row.pack(fill='x', padx=14, pady=(8, 4))
+        tk.Label(token_row, text='Vault Token', bg=BG_CARD, fg=FG_DIM,
+                 font=('Segoe UI', 9)).pack(side='left', padx=(0, 8))
+        self._vault_token_var = tk.StringVar(
+            value=self._cfg.get('vault_token', ''))
+        token_entry = ttk.Entry(token_row, textvariable=self._vault_token_var,
+                                width=50)
+        token_entry.pack(side='left', fill='x', expand=True)
+        self._vault_token_var.trace_add('write', self._update_vault_btn_state)
+
+        # Export button + status
+        export_row = tk.Frame(self._vault_body, bg=BG_CARD)
+        export_row.pack(fill='x', padx=14, pady=(4, 10))
+        self._vault_export_btn = ttk.Button(
+            export_row, text='Export Collection Manifest',
+            style='Accent.TButton', command=self._export_vault)
+        self._vault_export_btn.pack(side='left')
+        self._vault_export_btn.configure(state='disabled')
+        self._vault_status_var = tk.StringVar(value='')
+        tk.Label(export_row, textvariable=self._vault_status_var,
+                 bg=BG_CARD, fg=FG_DIM,
+                 font=('Segoe UI', 9)).pack(side='left', padx=(12, 0))
+
+        # Spacer at bottom of vault card when collapsed
+        self._vault_spacer = tk.Frame(self._vault_card, bg=BG_CARD, height=10)
+        self._vault_spacer.pack(fill='x')
 
         # -- Action bar --
-        action_frame = tk.Frame(main, bg=BG)
-        action_frame.pack(fill='x', pady=(0, 8))
+        self._action_frame = tk.Frame(main, bg=BG)
+        self._action_frame.pack(fill='x', pady=(0, 8))
 
-        self._go_btn = ttk.Button(action_frame,
+        self._go_btn = ttk.Button(self._action_frame,
                                   text='\u25B6  Decrypt && Organize',
                                   style='Accent.TButton',
                                   command=self._start)
         self._go_btn.pack(side='left')
 
-        self._pct_label = tk.Label(action_frame, text='', bg=BG, fg=FG_DIM,
+        self._pct_label = tk.Label(self._action_frame, text='', bg=BG, fg=FG_DIM,
                                    font=('Segoe UI', 9))
         self._pct_label.pack(side='right', padx=(8, 0))
 
-        self._progress = ttk.Progressbar(action_frame, mode='determinate',
+        self._progress = ttk.Progressbar(self._action_frame, mode='determinate',
                                          length=300,
                                          style='Horizontal.TProgressbar')
         self._progress.pack(side='right', fill='x', expand=True, padx=(12, 0))
@@ -465,6 +566,9 @@ class App(tk.Tk):
                               font=('Segoe UI', 9), anchor='w', padx=12)
         status_bar.pack(side='bottom', fill='x', ipady=3)
 
+        # Apply initial output mode state (after action_frame exists)
+        self._on_output_mode_change()
+
     def _init_taskbar(self):
         try:
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
@@ -484,7 +588,115 @@ class App(tk.Tk):
             self._opt_title_id.set(True)
         self._update_preview()
 
+    def _on_output_mode_change(self):
+        mode = self._output_mode_var.get()
+        # Show/hide custom folder entry
+        if mode == 1:
+            self._custom_folder_frame.pack(anchor='w', pady=(2, 2))
+        else:
+            self._custom_folder_frame.pack_forget()
+        # Show/hide organization options card (only for Organized mode)
+        # Re-pack both cards in correct order (before the action frame)
+        self._opts_card.pack_forget()
+        self._vault_card.pack_forget()
+        if mode == 0:
+            self._opts_card.pack(fill='x', pady=(0, 8),
+                                 before=self._action_frame)
+        self._vault_card.pack(fill='x', pady=(0, 8),
+                              before=self._action_frame)
+        self._update_preview()
+
+    def _toggle_vault(self):
+        if self._vault_expanded:
+            self._vault_body.pack_forget()
+            self._vault_arrow_var.set('\u25B6')
+            self._vault_expanded = False
+        else:
+            self._vault_spacer.pack_forget()
+            self._vault_body.pack(fill='x')
+            self._vault_spacer.pack(fill='x')
+            self._vault_arrow_var.set('\u25BC')
+            self._vault_expanded = True
+
+    def _update_vault_btn_state(self, *_args):
+        token = self._vault_token_var.get().strip()
+        has_avatars = (self._last_stats is not None
+                       and self._last_stats.get('ok', 0) > 0)
+        if token and has_avatars:
+            self._vault_export_btn.configure(state='normal')
+        else:
+            self._vault_export_btn.configure(state='disabled')
+
+    def _export_vault(self):
+        token = self._vault_token_var.get().strip()
+        if not token:
+            self._vault_status_var.set('Enter a vault token first.')
+            return
+        if not self._last_stats or not self._last_stats.get('avatars'):
+            self._vault_status_var.set('No avatars to export. Run a scan first.')
+            return
+
+        manifest = {
+            'token': token,
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+            'avatars': self._last_stats['avatars'],
+        }
+
+        # Serialize without sig for signing
+        manifest_json = json.dumps(manifest, separators=(',', ':'),
+                                   sort_keys=True)
+        sig = hmac.new(token.encode('utf-8'), manifest_json.encode('utf-8'),
+                       hashlib.sha256).hexdigest()
+        manifest['sig'] = sig
+
+        # Determine output path
+        out_dir = self._output_var.get().strip()
+        mode = self._output_mode_var.get()
+        if mode == 1:
+            custom = self._custom_folder_var.get().strip()
+            if custom:
+                out_dir = custom
+        if not out_dir:
+            self._vault_status_var.set('No output folder set.')
+            return
+
+        out_path = Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        manifest_file = out_path / 'vault_manifest.json'
+
+        try:
+            manifest_file.write_text(
+                json.dumps(manifest, indent=2), encoding='utf-8')
+            self._vault_status_var.set(
+                f'Manifest saved to {manifest_file} \u2014 '
+                f'upload this to vault.psna.store')
+        except Exception as e:
+            self._vault_status_var.set(f'Error saving manifest: {e}')
+
+    def _browse_custom_folder(self):
+        d = filedialog.askdirectory(
+            title='Select Custom Output Folder',
+            initialdir=self._custom_folder_var.get() or None)
+        if d:
+            self._custom_folder_var.set(d)
+
     def _update_preview(self):
+        mode = self._output_mode_var.get()
+
+        if mode == 1:
+            # Flat — Custom Folder
+            custom = self._custom_folder_var.get().strip()
+            folder_name = Path(custom).name if custom else 'custom_folder'
+            self._preview_var.set(
+                f'{folder_name}/PSNA_000.png  +  PSNA_000.edat')
+            return
+        elif mode == 2:
+            # Flat — Separated
+            self._preview_var.set(
+                'previews/PSNA_000.png\npsn_avatar/PSNA_000.edat')
+            return
+
+        # Organized mode
         parts_folder = []
         if self._opt_game_name.get():
             parts_folder.append('Game Name')
@@ -507,13 +719,19 @@ class App(tk.Tk):
             self._preview_var.set(f'US/{folder}/{fname}  +  PSNA_000.edat')
 
     def _get_options(self):
-        return {
+        mode = self._output_mode_var.get()
+        mode_map = {0: 'organized', 1: 'flat_custom', 2: 'flat_separated'}
+        opts = {
             'content_id_in_filename': self._opt_content_id.get(),
             'show_game_name': self._opt_game_name.get(),
             'show_title_id': self._opt_title_id.get(),
             'show_count': self._opt_count.get(),
             'separate_folders': self._opt_separate.get(),
+            'output_mode': mode_map.get(mode, 'organized'),
         }
+        if mode == 1:
+            opts['flat_custom_folder'] = self._custom_folder_var.get().strip()
+        return opts
 
     # ---- Log helpers ----
 
@@ -550,6 +768,8 @@ class App(tk.Tk):
     def _start(self):
         inp = self._input_var.get().strip()
         out = self._output_var.get().strip()
+        mode = self._output_mode_var.get()
+
         if not inp:
             messagebox.showwarning('Missing Input',
                                    'Please select an input folder.')
@@ -558,12 +778,22 @@ class App(tk.Tk):
             messagebox.showerror('Invalid Input',
                                  f'Input folder does not exist:\n{inp}')
             return
-        if not out:
+
+        # For flat_custom mode, validate the custom folder instead
+        if mode == 1:
+            custom = self._custom_folder_var.get().strip()
+            if not custom:
+                messagebox.showwarning('Missing Custom Folder',
+                                       'Please enter a custom output folder path.')
+                return
+        elif not out:
             messagebox.showwarning('Missing Output',
                                    'Please select an output folder.')
             return
 
         self._running = True
+        self._last_stats = None
+        self._update_vault_btn_state()
         self._start_time = time.time()
         self._go_btn.configure(state='disabled')
         self._progress['value'] = 0
@@ -575,26 +805,44 @@ class App(tk.Tk):
 
         opts = self._get_options()
 
+        mode_labels = {
+            'organized': 'Organized',
+            'flat_custom': 'Flat \u2014 Custom Folder',
+            'flat_separated': 'Flat \u2014 Separated',
+        }
+        effective_out = opts.get('flat_custom_folder', out) if mode == 1 else out
+
         self._log_write(f'Input:  {inp}', 'info')
-        self._log_write(f'Output: {out}', 'info')
+        self._log_write(f'Output: {effective_out}', 'info')
+        self._log_write(f'Mode:   {mode_labels.get(opts["output_mode"], "Unknown")}', 'info')
         opt_desc = []
-        if opts['content_id_in_filename']:
-            opt_desc.append('Content ID in filenames')
-        if opts['show_game_name']:
-            opt_desc.append('Game Name')
-        if opts['show_title_id']:
-            opt_desc.append('Title ID')
-        if opts['show_count']:
-            opt_desc.append('Count')
-        if opts['separate_folders']:
-            opt_desc.append('Separate PNG/EDAT folders')
-        self._log_write(f'Options: {", ".join(opt_desc)}', 'info')
+        if opts['output_mode'] == 'organized':
+            if opts['content_id_in_filename']:
+                opt_desc.append('Content ID in filenames')
+            if opts['show_game_name']:
+                opt_desc.append('Game Name')
+            if opts['show_title_id']:
+                opt_desc.append('Title ID')
+            if opts['show_count']:
+                opt_desc.append('Count')
+            if opts['separate_folders']:
+                opt_desc.append('Separate PNG/EDAT folders')
+            if opt_desc:
+                self._log_write(f'Options: {", ".join(opt_desc)}', 'info')
         self._log_write('', 'info')
 
-        self._cfg.update(input=inp, output=out, **opts)
+        # Save config (including new output_mode fields)
+        self._cfg.update(
+            input=inp, output=out,
+            output_mode=mode,
+            flat_custom_folder=self._custom_folder_var.get().strip(),
+            vault_token=self._vault_token_var.get().strip(),
+            **{k: v for k, v in opts.items()
+               if k not in ('output_mode', 'flat_custom_folder')},
+        )
         save_config(self._cfg)
 
-        self._output_folder = out
+        self._output_folder = effective_out
 
         t = threading.Thread(target=self._worker, args=(inp, out, opts),
                              daemon=True)
@@ -657,6 +905,8 @@ class App(tk.Tk):
 
     def _on_done(self, stats):
         self._running = False
+        self._last_stats = stats
+        self._update_vault_btn_state()
         self._go_btn.configure(state='normal')
         elapsed = time.time() - self._start_time
 
