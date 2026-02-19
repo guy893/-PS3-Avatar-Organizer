@@ -326,7 +326,7 @@ class App(tk.Tk):
                              font=('Segoe UI', 18, 'bold'))
         title_lbl.pack(side='left')
 
-        version_lbl = tk.Label(header, text='v1.1', bg=BG, fg=FG_DIM,
+        version_lbl = tk.Label(header, text='v1.2', bg=BG, fg=FG_DIM,
                                font=('Segoe UI', 10))
         version_lbl.pack(side='left', padx=(8, 0), pady=(8, 0))
 
@@ -404,12 +404,12 @@ class App(tk.Tk):
             command=self._on_output_mode_change,
         ).pack(anchor='w', pady=1)
 
-        # -- Organization options card (visible only in Organized mode) --
-        self._opts_card = make_card(main)
-        opts_inner = tk.Frame(self._opts_card, bg=BG_CARD)
-        opts_inner.pack(fill='x', padx=14, pady=10)
+        # -- Filename options card (always visible) --
+        self._filename_card = make_card(main)
+        fname_inner = tk.Frame(self._filename_card, bg=BG_CARD)
+        fname_inner.pack(fill='x', padx=14, pady=10)
 
-        tk.Label(opts_inner, text='Organization Options', bg=BG_CARD,
+        tk.Label(fname_inner, text='Filename Options', bg=BG_CARD,
                  fg=FG_HEADING,
                  font=('Segoe UI', 10, 'bold')).grid(
                      row=0, column=0, columnspan=2, sticky='w', pady=(0, 6))
@@ -417,10 +417,28 @@ class App(tk.Tk):
         self._opt_content_id = tk.BooleanVar(
             value=self._cfg.get('content_id_in_filename', True))
         ttk.Checkbutton(
-            opts_inner, text='Include Content ID in filenames',
+            fname_inner, text='Content ID in PNG filenames',
             variable=self._opt_content_id,
             command=self._update_preview,
-        ).grid(row=1, column=0, sticky='w', columnspan=2, pady=1)
+        ).grid(row=1, column=0, sticky='w', pady=1)
+
+        self._opt_content_id_edat = tk.BooleanVar(
+            value=self._cfg.get('content_id_in_edat', False))
+        ttk.Checkbutton(
+            fname_inner, text='Content ID in EDAT filenames',
+            variable=self._opt_content_id_edat,
+            command=self._update_preview,
+        ).grid(row=1, column=1, sticky='w', pady=1)
+
+        # -- Organization options card (visible only in Organized mode) --
+        self._opts_card = make_card(main)
+        opts_inner = tk.Frame(self._opts_card, bg=BG_CARD)
+        opts_inner.pack(fill='x', padx=14, pady=10)
+
+        tk.Label(opts_inner, text='Folder Options', bg=BG_CARD,
+                 fg=FG_HEADING,
+                 font=('Segoe UI', 10, 'bold')).grid(
+                     row=0, column=0, columnspan=2, sticky='w', pady=(0, 6))
 
         self._opt_game_name = tk.BooleanVar(
             value=self._cfg.get('show_game_name', True))
@@ -428,7 +446,7 @@ class App(tk.Tk):
             opts_inner, text='Game Name in folder',
             variable=self._opt_game_name,
             command=self._validate_folder_opts,
-        ).grid(row=2, column=0, sticky='w', pady=1)
+        ).grid(row=1, column=0, sticky='w', pady=1)
 
         self._opt_title_id = tk.BooleanVar(
             value=self._cfg.get('show_title_id', True))
@@ -436,7 +454,7 @@ class App(tk.Tk):
             opts_inner, text='Title ID in folder',
             variable=self._opt_title_id,
             command=self._validate_folder_opts,
-        ).grid(row=2, column=1, sticky='w', pady=1)
+        ).grid(row=1, column=1, sticky='w', pady=1)
 
         self._opt_count = tk.BooleanVar(
             value=self._cfg.get('show_count', True))
@@ -444,7 +462,7 @@ class App(tk.Tk):
             opts_inner, text='Avatar count in folder',
             variable=self._opt_count,
             command=self._update_preview,
-        ).grid(row=3, column=0, sticky='w', pady=1)
+        ).grid(row=2, column=0, sticky='w', pady=1)
 
         self._opt_separate = tk.BooleanVar(
             value=self._cfg.get('separate_folders', False))
@@ -452,15 +470,15 @@ class App(tk.Tk):
             opts_inner, text='Separate folders for PNGs and EDATs',
             variable=self._opt_separate,
             command=self._update_preview,
-        ).grid(row=3, column=1, sticky='w', pady=1)
+        ).grid(row=2, column=1, sticky='w', pady=1)
 
-        # Preview
+        # Preview (in filename card, so it's always visible)
         self._preview_var = tk.StringVar()
-        tk.Label(opts_inner, textvariable=self._preview_var,
+        tk.Label(fname_inner, textvariable=self._preview_var,
                  fg=FG_PREVIEW, bg=BG_CARD,
                  font=('Consolas', 9), anchor='w',
                  justify='left').grid(
-                     row=4, column=0, columnspan=2, sticky='w',
+                     row=2, column=0, columnspan=2, sticky='w',
                      pady=(6, 2))
 
         # -- Vault Export card (collapsible) --
@@ -610,10 +628,14 @@ class App(tk.Tk):
             self._custom_folder_frame.pack(anchor='w', pady=(2, 2))
         else:
             self._custom_folder_frame.pack_forget()
-        # Show/hide organization options card (only for Organized mode)
-        # Re-pack both cards in correct order (before the action frame)
+        # Re-pack cards in correct order (before the action frame)
+        self._filename_card.pack_forget()
         self._opts_card.pack_forget()
         self._vault_card.pack_forget()
+        # Filename options always visible
+        self._filename_card.pack(fill='x', pady=(0, 8),
+                                 before=self._action_frame)
+        # Folder options only for Organized mode
         if mode == 0:
             self._opts_card.pack(fill='x', pady=(0, 8),
                                  before=self._action_frame)
@@ -698,17 +720,28 @@ class App(tk.Tk):
     def _update_preview(self):
         mode = self._output_mode_var.get()
 
+        # Build example filenames based on content ID options
+        cid = 'UP0082-ULUS10566_00-...'
+        if self._opt_content_id.get():
+            png_name = f'{cid} - PSNA_000.png'
+        else:
+            png_name = 'PSNA_000.png'
+        if self._opt_content_id_edat.get():
+            edat_name = f'{cid} - PSNA_000.edat'
+        else:
+            edat_name = 'PSNA_000.edat'
+
         if mode == 1:
             # Flat — Custom Folder
             custom = self._custom_folder_var.get().strip()
             folder_name = Path(custom).name if custom else 'custom_folder'
             self._preview_var.set(
-                f'{folder_name}/PSNA_000.png  +  PSNA_000.edat')
+                f'{folder_name}/{png_name}  +  {edat_name}')
             return
         elif mode == 2:
             # Flat — Separated
             self._preview_var.set(
-                'previews/PSNA_000.png\npsn_avatar/PSNA_000.edat')
+                f'previews/{png_name}\npsn_avatar/{edat_name}')
             return
 
         # Organized mode
@@ -721,23 +754,19 @@ class App(tk.Tk):
         if self._opt_count.get():
             folder += ' (24)'
 
-        if self._opt_content_id.get():
-            fname = 'UP0082-ULUS10566_00-... - PSNA_000.png'
-        else:
-            fname = 'PSNA_000.png'
-
         if self._opt_separate.get():
-            line1 = f'US/{folder}/previews/{fname}'
-            line2 = f'US/{folder}/psn_avatar/PSNA_000.edat'
+            line1 = f'US/{folder}/previews/{png_name}'
+            line2 = f'US/{folder}/psn_avatar/{edat_name}'
             self._preview_var.set(f'{line1}\n{line2}')
         else:
-            self._preview_var.set(f'US/{folder}/{fname}  +  PSNA_000.edat')
+            self._preview_var.set(f'US/{folder}/{png_name}  +  {edat_name}')
 
     def _get_options(self):
         mode = self._output_mode_var.get()
         mode_map = {0: 'organized', 1: 'flat_custom', 2: 'flat_separated'}
         opts = {
             'content_id_in_filename': self._opt_content_id.get(),
+            'content_id_in_edat': self._opt_content_id_edat.get(),
             'show_game_name': self._opt_game_name.get(),
             'show_title_id': self._opt_title_id.get(),
             'show_count': self._opt_count.get(),
@@ -831,9 +860,11 @@ class App(tk.Tk):
         self._log_write(f'Output: {effective_out}', 'info')
         self._log_write(f'Mode:   {mode_labels.get(opts["output_mode"], "Unknown")}', 'info')
         opt_desc = []
+        if opts['content_id_in_filename']:
+            opt_desc.append('Content ID in PNGs')
+        if opts['content_id_in_edat']:
+            opt_desc.append('Content ID in EDATs')
         if opts['output_mode'] == 'organized':
-            if opts['content_id_in_filename']:
-                opt_desc.append('Content ID in filenames')
             if opts['show_game_name']:
                 opt_desc.append('Game Name')
             if opts['show_title_id']:
@@ -842,8 +873,8 @@ class App(tk.Tk):
                 opt_desc.append('Count')
             if opts['separate_folders']:
                 opt_desc.append('Separate PNG/EDAT folders')
-            if opt_desc:
-                self._log_write(f'Options: {", ".join(opt_desc)}', 'info')
+        if opt_desc:
+            self._log_write(f'Options: {", ".join(opt_desc)}', 'info')
         self._log_write('', 'info')
 
         # Save config (including new output_mode fields)
