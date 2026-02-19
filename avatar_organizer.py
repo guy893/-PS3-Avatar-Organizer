@@ -189,9 +189,10 @@ FLAG_0x20          = 0x00000020
 # EDAT Decryption
 # ============================================================
 
-def decrypt_edat(edat_path, output_path):
+def decrypt_edat(edat_path, output_path, dat_path=None):
     """
     Decrypt a PSN avatar EDAT file and extract the image.
+    If dat_path is provided, also saves the raw decrypted payload.
     Returns (success: bool, message: str).
     """
     try:
@@ -269,6 +270,10 @@ def decrypt_edat(edat_path, output_path):
             output.extend(dec[:this_size])
 
         output = bytes(output[:data_size])
+
+        if dat_path:
+            with open(dat_path, 'wb') as f:
+                f.write(output)
 
         png_off = output.find(b'\x89PNG\r\n\x1a\n')
         jpg_off = output.find(b'\xff\xd8\xff')
@@ -406,6 +411,40 @@ def extract_title_id(content_id):
     return rest[:under]
 
 
+def is_valid_psna_name(stem):
+    """Check that stem matches PSNA_ + exactly 40 hex characters."""
+    if len(stem) != 45:
+        return False
+    if not stem.upper().startswith('PSNA_'):
+        return False
+    hex_part = stem[5:]
+    try:
+        int(hex_part, 16)
+        return True
+    except ValueError:
+        return False
+
+
+def normalize_psna_stem(stem):
+    """Extract the canonical PSNA_ + 40 hex chars from a stem, stripping
+    copy/duplicate suffixes like '_1', ' (1)', ' - Copy', etc.
+    Returns the normalized 45-char stem, or the original stem if it
+    doesn't contain a valid PSNA name."""
+    upper = stem.upper()
+    idx = upper.find('PSNA_')
+    if idx < 0:
+        return stem
+    candidate = stem[idx:idx + 45]
+    if len(candidate) == 45:
+        hex_part = candidate[5:]
+        try:
+            int(hex_part, 16)
+            return candidate
+        except ValueError:
+            pass
+    return stem
+
+
 def _sanitize_filename(name):
     """Remove or replace characters illegal in Windows file/folder names."""
     # Illegal: \ / : * ? " < > |
@@ -444,7 +483,7 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
     When ``options`` is None, falls back to legacy OrgMode enum behaviour.
 
     Returns:
-        dict with keys: ok, skip, fail, total, failures, output_pngs, avatars
+        dict with keys: ok, skip, fail, total, failures, output_pngs, output_edats, avatars
     """
     input_path = Path(input_folder)
     output_path = Path(output_folder)
@@ -457,10 +496,14 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
     if options is not None:
         output_mode = options.get('output_mode', 'organized')
         use_content_id = options.get('content_id_in_filename', True)
+        use_content_id_edat = options.get('content_id_in_edat', False)
         show_game = options.get('show_game_name', True)
         show_tid = options.get('show_title_id', True)
         show_count = options.get('show_count', True)
         separate = options.get('separate_folders', False)
+
+        output_dat = options.get('output_dat', False)
+        generate_lists = options.get('generate_lists', False)
 
         if output_mode == 'flat_custom':
             custom_folder = options.get('flat_custom_folder', '')
@@ -478,18 +521,24 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
     elif mode is not None:
         # Legacy OrgMode support
         use_content_id = True
+        use_content_id_edat = False
         show_game = True
         show_tid = True
         show_count = True
         use_folders = (mode != OrgMode.FLAT)
         separate = (mode == OrgMode.REGION_GAME_SEPARATED)
+        output_dat = False
+        generate_lists = False
     else:
         use_content_id = True
+        use_content_id_edat = False
         show_game = True
         show_tid = True
         show_count = True
         use_folders = False
         separate = False
+        output_dat = False
+        generate_lists = False
 
     # Scan for EDAT files
     edat_files = []
@@ -497,15 +546,11 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
         edat_files.extend(input_path.rglob(pattern))
     edat_files = sorted(set(edat_files))
 
-    # Filter out Windows copy duplicates (e.g. "PSNA_xxx - Copy.edat")
-    edat_files = [f for f in edat_files
-                  if ' - copy' not in f.stem.lower()
-                  and not f.stem.lower().endswith(' - copy')]
-
-    # Deduplicate by stem, preferring license type 3 (free) over type 2
-    seen = {}  # stem -> file path
+    # Deduplicate by normalized PSNA stem (strips copy/duplicate suffixes
+    # like '_1', ' (1)', ' - Copy'), preferring license type 3 (free) over type 2
+    seen = {}  # normalized stem -> file path
     for f in edat_files:
-        name = f.stem
+        name = normalize_psna_stem(f.stem)
         if name not in seen:
             seen[name] = f
         else:
@@ -517,7 +562,7 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
 
     total = len(unique_files)
     stats = {'ok': 0, 'skip': 0, 'fail': 0, 'total': total, 'failures': [],
-             'output_pngs': [], 'avatars': []}
+             'output_pngs': [], 'output_edats': [], 'avatars': []}
 
     if total == 0:
         return stats
@@ -525,7 +570,7 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
     game_folder_counts = {}  # folder_key -> {'region': ..., 'count': ...}
 
     for idx, edat_file in enumerate(unique_files):
-        psna_name = edat_file.stem
+        psna_name = normalize_psna_stem(edat_file.stem)
 
         try:
             content_id = read_content_id(edat_file)
@@ -553,7 +598,13 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
                         progress_cb(idx + 1, total, 'skip', psna_name)
                     continue
 
-                success, msg = decrypt_edat(edat_file, out_file)
+                # Compute .dat path if requested
+                dat_file = None
+                if output_dat:
+                    dat_name = out_file.stem + '.dat'
+                    dat_file = out_file.parent / dat_name
+
+                success, msg = decrypt_edat(edat_file, out_file, dat_path=dat_file)
                 if success:
                     stats['ok'] += 1
                     stats['output_pngs'].append(str(out_file))
@@ -566,15 +617,25 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
                         'file_hash': file_hash,
                     })
 
+                    # Build EDAT output name
+                    if use_content_id_edat:
+                        edat_out_name = _sanitize_filename(f"{content_id} - {psna_name}") + ".edat"
+                    else:
+                        edat_out_name = edat_file.name
+
                     # Copy EDAT alongside in flat_separated / flat_custom modes
                     if output_mode == 'flat_separated':
-                        edat_dest = edat_dir / edat_file.name
-                        if not edat_dest.exists():
-                            shutil.copy2(edat_file, edat_dest)
+                        if is_valid_psna_name(edat_file.stem):
+                            edat_dest = edat_dir / edat_out_name
+                            if not edat_dest.exists():
+                                shutil.copy2(edat_file, edat_dest)
+                                stats['output_edats'].append(edat_out_name)
                     elif output_mode == 'flat_custom':
-                        edat_dest = output_path / edat_file.name
-                        if not edat_dest.exists():
-                            shutil.copy2(edat_file, edat_dest)
+                        if is_valid_psna_name(edat_file.stem):
+                            edat_dest = output_path / edat_out_name
+                            if not edat_dest.exists():
+                                shutil.copy2(edat_file, edat_dest)
+                                stats['output_edats'].append(edat_out_name)
 
                     if progress_cb:
                         progress_cb(idx + 1, total, 'ok', psna_name)
@@ -617,7 +678,13 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
                         progress_cb(idx + 1, total, 'skip', psna_name)
                     continue
 
-                success, msg = decrypt_edat(edat_file, out_file)
+                # Compute .dat path if requested
+                dat_file = None
+                if output_dat:
+                    dat_name = out_file.stem + '.dat'
+                    dat_file = out_file.parent / dat_name
+
+                success, msg = decrypt_edat(edat_file, out_file, dat_path=dat_file)
 
                 if success:
                     stats['ok'] += 1
@@ -632,13 +699,21 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
                         'file_hash': file_hash,
                     })
 
-                    # Copy EDAT alongside
-                    if separate:
-                        edat_dest = edat_dir / edat_file.name
+                    # Build EDAT output name
+                    if use_content_id_edat:
+                        edat_out_name = _sanitize_filename(f"{content_id} - {psna_name}") + ".edat"
                     else:
-                        edat_dest = game_base / edat_file.name
-                    if not edat_dest.exists():
-                        shutil.copy2(edat_file, edat_dest)
+                        edat_out_name = edat_file.name
+
+                    # Copy EDAT alongside (only if valid PSNA name)
+                    if is_valid_psna_name(edat_file.stem):
+                        if separate:
+                            edat_dest = edat_dir / edat_out_name
+                        else:
+                            edat_dest = game_base / edat_out_name
+                        if not edat_dest.exists():
+                            shutil.copy2(edat_file, edat_dest)
+                            stats['output_edats'].append(edat_out_name)
 
                     if progress_cb:
                         progress_cb(idx + 1, total, 'ok', psna_name)
@@ -689,10 +764,24 @@ def organize_with_mode(input_folder, output_folder, mode=None, title_lookup=None
                 if not new_path.exists():
                     actual_folder.rename(new_path)
 
+    # Generate txt file lists if requested
+    if generate_lists and (stats['output_pngs'] or stats['output_edats']):
+        if stats['output_pngs']:
+            png_list_path = output_path / 'png_list.txt'
+            with open(png_list_path, 'w') as f:
+                for p in stats['output_pngs']:
+                    f.write(os.path.basename(p) + '\n')
+        if stats['output_edats']:
+            edat_list_path = output_path / 'edat_list.txt'
+            with open(edat_list_path, 'w') as f:
+                for e in stats['output_edats']:
+                    f.write(e + '\n')
+
     return stats
 
 
-def organize_avatars(input_folder, output_folder, verbose=False):
+def organize_avatars(input_folder, output_folder, verbose=False, generate_lists=False,
+                     output_dat=False):
     input_path = Path(input_folder)
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -713,7 +802,7 @@ def organize_avatars(input_folder, output_folder, verbose=False):
     seen = set()
     unique_files = []
     for f in edat_files:
-        name = f.stem
+        name = normalize_psna_stem(f.stem)
         if name not in seen:
             seen.add(name)
             unique_files.append(f)
@@ -723,9 +812,11 @@ def organize_avatars(input_folder, output_folder, verbose=False):
 
     bar = ProgressBar(len(unique_files))
     failures = []
+    output_pngs = []
+    output_edats = []
 
     for edat_file in unique_files:
-        psna_name = edat_file.stem
+        psna_name = normalize_psna_stem(edat_file.stem)
 
         try:
             content_id = read_content_id(edat_file)
@@ -736,10 +827,17 @@ def organize_avatars(input_folder, output_folder, verbose=False):
                 bar.update('skip')
                 continue
 
-            success, message = decrypt_edat(edat_file, output_file)
+            dat_file = None
+            if output_dat:
+                dat_file = output_path / (output_file.stem + '.dat')
+
+            success, message = decrypt_edat(edat_file, output_file, dat_path=dat_file)
 
             if success:
                 bar.update('ok')
+                output_pngs.append(output_file.name)
+                if is_valid_psna_name(edat_file.stem):
+                    output_edats.append(edat_file.name)
                 if verbose:
                     sys.stderr.write(f'\n  OK  {output_name}\n')
             else:
@@ -766,6 +864,19 @@ def organize_avatars(input_folder, output_folder, verbose=False):
         if len(failures) > 20:
             print(f"  ... and {len(failures) - 20} more")
 
+    # Generate txt file lists if requested
+    if generate_lists and (output_pngs or output_edats):
+        if output_pngs:
+            with open(output_path / 'png_list.txt', 'w') as f:
+                for name in output_pngs:
+                    f.write(name + '\n')
+            print(f"  Wrote png_list.txt ({len(output_pngs)} entries)")
+        if output_edats:
+            with open(output_path / 'edat_list.txt', 'w') as f:
+                for name in output_edats:
+                    f.write(name + '\n')
+            print(f"  Wrote edat_list.txt ({len(output_edats)} entries)")
+
 
 def main():
     if len(sys.argv) < 2:
@@ -774,14 +885,20 @@ def main():
         print("Usage:")
         print(f"  python {sys.argv[0]} <input_folder> [output_folder]")
         print()
-        print("  -v  Verbose output (print each filename)")
+        print("  -v      Verbose output (print each filename)")
+        print("  --list  Generate png_list.txt and edat_list.txt")
+        print("  --dat   Also output raw decrypted .dat files")
         print()
         print("Example:")
         print(f'  python {sys.argv[0]} "/path/to/PS3/avatars" ./organized')
+        print(f'  python {sys.argv[0]} ./input ./output --list --dat -v')
         sys.exit(1)
 
+    flags = {'-v', '--list', '--dat'}
     verbose = '-v' in sys.argv
-    args = [a for a in sys.argv[1:] if a != '-v']
+    generate_lists = '--list' in sys.argv
+    output_dat = '--dat' in sys.argv
+    args = [a for a in sys.argv[1:] if a not in flags]
 
     input_folder = args[0]
     output_folder = args[1] if len(args) > 1 else './organized_avatars'
@@ -790,7 +907,8 @@ def main():
         print(f"Error: Input folder '{input_folder}' does not exist")
         sys.exit(1)
 
-    organize_avatars(input_folder, output_folder, verbose=verbose)
+    organize_avatars(input_folder, output_folder, verbose=verbose,
+                     generate_lists=generate_lists, output_dat=output_dat)
 
 
 if __name__ == '__main__':
